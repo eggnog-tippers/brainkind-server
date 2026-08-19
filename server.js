@@ -94,6 +94,14 @@ app.post('/api/unsubscribe', (req, res) => {
   res.json({ ok: true });
 });
 
+// External cron (e.g. cron-job.org) hits this every minute so checks still
+// run even after Render's free tier has spun the service down and a cron
+// ping wakes it back up.
+app.get('/api/check', async (req, res) => {
+  await checkAndSend();
+  res.json({ ok: true, checkedAt: new Date().toISOString() });
+});
+
 app.listen(PORT, () => console.log(`Brainkind push server listening on :${PORT}`));
 
 /* ---------- scheduler: checks every minute ---------- */
@@ -107,6 +115,10 @@ function dateInZone(tz) {
   const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz }); // YYYY-MM-DD
   return fmt.format(new Date());
 }
+function toMinutes(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+}
 
 const MESSAGES = {
   en: (name, time) => ({ title: 'Brainkind', body: `${name} · ${time} — tap to log` }),
@@ -117,13 +129,15 @@ async function checkAndSend() {
   let dirty = false;
   for (const [endpoint, entry] of Object.entries(data.subscriptions)) {
     const tz = entry.timezone || 'UTC';
-    const nowHHMM = timeInZone(tz);
+    const nowMinutes = toMinutes(timeInZone(tz));
     const today = dateInZone(tz);
     entry.sentLog[today] = entry.sentLog[today] || [];
 
     for (const med of entry.meds || []) {
       for (const time of med.times || []) {
-        if (time !== nowHHMM) continue;
+        // Fire once the scheduled minute has arrived (or passed, in case a
+        // cron ping was late or missed) rather than requiring an exact match.
+        if (toMinutes(time) > nowMinutes) continue;
         const marker = `${med.name}|${time}`;
         if (entry.sentLog[today].includes(marker)) continue;
 

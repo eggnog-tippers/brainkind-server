@@ -1,4 +1,4 @@
-// Brainkind push server
+// MediKind push server
 // Stores each device's push subscription + medication schedule, and checks
 // every minute whether any dose time has arrived for that device's timezone.
 // Data persists to a local JSON file — fine for personal/single- or
@@ -54,7 +54,7 @@ app.get('/api/vapid-public-key', (req, res) => res.json({ publicKey: VAPID_PUBLI
 
 // Register (or update) a device's push subscription
 app.post('/api/subscribe', (req, res) => {
-  const { subscription, timezone, lang } = req.body;
+  const { subscription, timezone, lang, app: appId } = req.body;
   if (!subscription || !subscription.endpoint) {
     return res.status(400).json({ error: 'Missing subscription' });
   }
@@ -64,6 +64,7 @@ app.post('/api/subscribe', (req, res) => {
     subscription,
     timezone: timezone || existing.timezone || 'UTC',
     lang: lang || existing.lang || 'en',
+    app: appId || existing.app || 'brainkind',
     meds: existing.meds || [],
     sentLog: existing.sentLog || {}
   };
@@ -73,13 +74,14 @@ app.post('/api/subscribe', (req, res) => {
 
 // Sync the medication schedule for a device
 app.post('/api/schedule', (req, res) => {
-  const { endpoint, meds, timezone, lang } = req.body;
+  const { endpoint, meds, timezone, lang, app: appId } = req.body;
   if (!endpoint || !data.subscriptions[endpoint]) {
     return res.status(404).json({ error: 'Unknown subscription — call /api/subscribe first' });
   }
   data.subscriptions[endpoint].meds = Array.isArray(meds) ? meds : [];
   if (timezone) data.subscriptions[endpoint].timezone = timezone;
   if (lang) data.subscriptions[endpoint].lang = lang;
+  if (appId) data.subscriptions[endpoint].app = appId;
   saveData(data);
   res.json({ ok: true });
 });
@@ -102,7 +104,7 @@ app.get('/api/check', async (req, res) => {
   res.json({ ok: true, checkedAt: new Date().toISOString() });
 });
 
-app.listen(PORT, () => console.log(`Brainkind push server listening on :${PORT}`));
+app.listen(PORT, () => console.log(`MediKind push server listening on :${PORT}`));
 
 /* ---------- scheduler: checks every minute ---------- */
 function timeInZone(tz) {
@@ -120,9 +122,11 @@ function toMinutes(hhmm) {
   return h * 60 + m;
 }
 
+const APP_NAMES = { brainkind: 'Brainkind', medikind: 'MediKind' };
+
 const MESSAGES = {
-  en: (name, time) => ({ title: 'Brainkind', body: `${name} · ${time} — tap to log` }),
-  ro: (name, time) => ({ title: 'Brainkind', body: `${name} · ${time} — atinge pentru a nota` })
+  en: (appName, name, time) => ({ title: appName, body: `${name} · ${time} — tap to log` }),
+  ro: (appName, name, time) => ({ title: appName, body: `${name} · ${time} — atinge pentru a nota` })
 };
 
 async function checkAndSend() {
@@ -141,7 +145,8 @@ async function checkAndSend() {
         const marker = `${med.name}|${time}`;
         if (entry.sentLog[today].includes(marker)) continue;
 
-        const msg = (MESSAGES[entry.lang] || MESSAGES.en)(med.name, time);
+        const appName = APP_NAMES[entry.app] || 'Reminder';
+        const msg = (MESSAGES[entry.lang] || MESSAGES.en)(appName, med.name, time);
         try {
           await webpush.sendNotification(entry.subscription, JSON.stringify(msg));
         } catch (err) {

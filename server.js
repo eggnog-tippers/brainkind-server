@@ -1,45 +1,64 @@
-// MediKind push server
+// Brainkind / MediKind push server
 // Stores each device's push subscription + medication schedule, and checks
 // every minute whether any dose time has arrived for that device's timezone.
-// Data persists to a local JSON file — fine for personal/single- or
-// few-user use. For many users, swap dataStore for a real database.
+// Data persists in Render Key Value (a small free Redis-compatible store),
+// so it survives restarts and redeploys — a local file does not, on
+// Render's free web service tier.
 
 const express = require('express');
 const webpush = require('web-push');
-const fs = require('fs');
-const path = require('path');
+const { createClient } = require('redis');
 
-const DATA_FILE = path.join(__dirname, 'data.json');
 const PORT = process.env.PORT || 3000;
+const DATA_KEY = 'brainkind:subscriptions'; // single JSON blob under one key
 
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:you@example.com';
+const REDIS_URL = process.env.REDIS_URL;
 
 if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
   console.error('Missing VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY environment variables.');
   console.error('Run "npm run generate-keys" once to create a pair, then set them.');
   process.exit(1);
 }
+if (!REDIS_URL) {
+  console.error('Missing REDIS_URL. Create a free Render Key Value instance and link it,');
+  console.error('or set REDIS_URL manually to its internal connection string.');
+  process.exit(1);
+}
 
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
-/* ---------- tiny JSON-file data store ---------- */
-function loadData() {
+/* ---------- Key Value backed data store ---------- */
+const redis = createClient({ url: REDIS_URL });
+redis.on('error', err => console.error('Redis error:', err.message));
+
+let data = { subscriptions: {} }; // in-memory working copy, synced to Redis
+
+async function loadData() {
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const raw = await redis.get(DATA_KEY);
+    data = raw ? JSON.parse(raw) : { subscriptions: {} };
   } catch (e) {
-    return { subscriptions: {} };
+    console.error('Failed to load data from Redis, starting empty:', e.message);
+    data = { subscriptions: {} };
   }
 }
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+async function saveData() {
+  try {
+    await redis.set(DATA_KEY, JSON.stringify(data));
+  } catch (e) {
+    console.error('Failed to save data to Redis:', e.message);
+  }
 }
-let data = loadData();
 
 /* ---------- app ---------- */
 const app = express();
-app.use(express.json());
+// Small explicit body-size cap — these endpoints only ever send small
+// JSON payloads (a subscription + a short medication list), so this is
+// cheap insurance against unexpectedly large or malformed requests.
+app.use(express.json({ limit: '20kb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -53,7 +72,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.get('/api/vapid-public-key', (req, res) => res.json({ publicKey: VAPID_PUBLIC_KEY }));
 
 // Register (or update) a device's push subscription
-app.post('/api/subscribe', (req, res) => {
+app.post('/api/subscribe', async (req, res) => {
   const { subscription, timezone, lang, app: appId } = req.body;
   if (!subscription || !subscription.endpoint) {
     return res.status(400).json({ error: 'Missing subscription' });
@@ -68,12 +87,12 @@ app.post('/api/subscribe', (req, res) => {
     meds: existing.meds || [],
     sentLog: existing.sentLog || {}
   };
-  saveData(data);
+  await saveData();
   res.json({ ok: true });
 });
 
 // Sync the medication schedule for a device
-app.post('/api/schedule', (req, res) => {
+app.post('/api/schedule', async (req, res) => {
   const { endpoint, meds, timezone, lang, app: appId } = req.body;
   if (!endpoint || !data.subscriptions[endpoint]) {
     return res.status(404).json({ error: 'Unknown subscription — call /api/subscribe first' });
@@ -82,16 +101,16 @@ app.post('/api/schedule', (req, res) => {
   if (timezone) data.subscriptions[endpoint].timezone = timezone;
   if (lang) data.subscriptions[endpoint].lang = lang;
   if (appId) data.subscriptions[endpoint].app = appId;
-  saveData(data);
+  await saveData();
   res.json({ ok: true });
 });
 
 // Remove a device's subscription entirely
-app.post('/api/unsubscribe', (req, res) => {
+app.post('/api/unsubscribe', async (req, res) => {
   const { endpoint } = req.body;
   if (endpoint && data.subscriptions[endpoint]) {
     delete data.subscriptions[endpoint];
-    saveData(data);
+    await saveData();
   }
   res.json({ ok: true });
 });
@@ -103,8 +122,6 @@ app.get('/api/check', async (req, res) => {
   await checkAndSend();
   res.json({ ok: true, checkedAt: new Date().toISOString() });
 });
-
-app.listen(PORT, () => console.log(`MediKind push server listening on :${PORT}`));
 
 /* ---------- scheduler: checks every minute ---------- */
 function timeInZone(tz) {
@@ -160,13 +177,20 @@ async function checkAndSend() {
         dirty = true;
       }
     }
-    // trim old day logs so the file doesn't grow forever
+    // trim old day logs so the stored blob doesn't grow forever
     const keepDates = Object.keys(entry.sentLog).slice(-3);
     Object.keys(entry.sentLog).forEach(d => {
       if (!keepDates.includes(d)) delete entry.sentLog[d];
     });
   }
-  if (dirty) saveData(data);
+  if (dirty) await saveData();
 }
 
-setInterval(checkAndSend, 60 * 1000);
+/* ---------- startup ---------- */
+async function start() {
+  await redis.connect();
+  await loadData();
+  app.listen(PORT, () => console.log(`Push server listening on :${PORT}`));
+  setInterval(checkAndSend, 60 * 1000);
+}
+start();

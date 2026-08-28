@@ -79,13 +79,16 @@ app.post('/api/subscribe', async (req, res) => {
   }
   const key = subscription.endpoint;
   const existing = data.subscriptions[key] || {};
+  const now = new Date().toISOString();
   data.subscriptions[key] = {
     subscription,
     timezone: timezone || existing.timezone || 'UTC',
     lang: lang || existing.lang || 'en',
     app: appId || existing.app || 'brainkind',
     meds: existing.meds || [],
-    sentLog: existing.sentLog || {}
+    sentLog: existing.sentLog || {},
+    createdAt: existing.createdAt || now,
+    lastSeenAt: now
   };
   await saveData();
   res.json({ ok: true });
@@ -101,6 +104,7 @@ app.post('/api/schedule', async (req, res) => {
   if (timezone) data.subscriptions[endpoint].timezone = timezone;
   if (lang) data.subscriptions[endpoint].lang = lang;
   if (appId) data.subscriptions[endpoint].app = appId;
+  data.subscriptions[endpoint].lastSeenAt = new Date().toISOString();
   await saveData();
   res.json({ ok: true });
 });
@@ -113,6 +117,24 @@ app.post('/api/unsubscribe', async (req, res) => {
     await saveData();
   }
   res.json({ ok: true });
+});
+
+// Lightweight diagnostics — no personal data, just counts, so it's safe to
+// check from a browser to see whether stale subscriptions are piling up.
+app.get('/api/stats', (req, res) => {
+  const entries = Object.values(data.subscriptions);
+  const byApp = {};
+  let orphaned = 0;
+  for (const e of entries) {
+    byApp[e.app || 'unknown'] = (byApp[e.app || 'unknown'] || 0) + 1;
+    if (!e.meds || e.meds.length === 0) orphaned++;
+  }
+  res.json({
+    totalSubscriptions: entries.length,
+    byApp,
+    orphaned, // registered but never got a medication schedule synced
+    memory: process.memoryUsage()
+  });
 });
 
 // External cron (e.g. cron-job.org) hits this every minute so checks still
@@ -186,11 +208,43 @@ async function checkAndSend() {
   if (dirty) await saveData();
 }
 
+// Remove subscriptions that registered but never received a medication
+// schedule, and have sat untouched for over a week — almost always leftover
+// test/abandoned registrations rather than active users, and left unchecked
+// they'd accumulate indefinitely since they never get pruned by a failed
+// push attempt (there's nothing scheduled to ever try sending to them).
+async function pruneAbandoned() {
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const [endpoint, entry] of Object.entries(data.subscriptions)) {
+    const hasSchedule = entry.meds && entry.meds.length > 0;
+    const lastSeen = new Date(entry.lastSeenAt || entry.createdAt || 0).getTime();
+    if (!hasSchedule && lastSeen < weekAgo) {
+      delete data.subscriptions[endpoint];
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    console.log(`Pruned ${removed} abandoned subscription(s).`);
+    await saveData();
+  }
+}
+
 /* ---------- startup ---------- */
 async function start() {
   await redis.connect();
   await loadData();
   app.listen(PORT, () => console.log(`Push server listening on :${PORT}`));
   setInterval(checkAndSend, 60 * 1000);
+  setInterval(pruneAbandoned, 24 * 60 * 60 * 1000); // once a day
+  pruneAbandoned(); // also run once at startup
+
+  // Light periodic memory logging — visible in Render's free Logs tab, so
+  // there's a way to see the actual trend even without the paid Metrics
+  // graph, useful if this happens again.
+  setInterval(() => {
+    const mem = process.memoryUsage();
+    console.log(`Memory: rss=${Math.round(mem.rss/1024/1024)}MB heapUsed=${Math.round(mem.heapUsed/1024/1024)}MB, subscriptions=${Object.keys(data.subscriptions).length}`);
+  }, 30 * 60 * 1000); // every 30 minutes
 }
 start();

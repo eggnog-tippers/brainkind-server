@@ -246,5 +246,17 @@ async function start() {
     const mem = process.memoryUsage();
     console.log(`Memory: rss=${Math.round(mem.rss/1024/1024)}MB heapUsed=${Math.round(mem.heapUsed/1024/1024)}MB, subscriptions=${Object.keys(data.subscriptions).length}`);
   }, 30 * 60 * 1000); // every 30 minutes
+
+  // Because a cron ping keeps this service awake around the clock, it never
+  // gets the natural restart a normally-idling free instance would get.
+  // Long-running Node processes can gradually accumulate memory outside the
+  // JS heap (from network connections, TLS, etc.) that doesn't show up as a
+  // "leak" in the data but still creeps RSS toward the free-tier ceiling.
+  // A scheduled, graceful restart well before that point avoids ever
+  // hitting it. Safe now that all data lives in Redis, not a local file.
+  setTimeout(() => {
+    console.log('Scheduled restart to keep memory healthy — data is safe in Redis.');
+    process.exit(0); // Render automatically restarts an exited service
+  }, 12 * 60 * 60 * 1000); // 12 hours
 }
 start();
